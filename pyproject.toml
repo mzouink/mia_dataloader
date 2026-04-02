@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mia-em-loader"
+version = "0.1.0"
+description = "3D multi-label EM data loading for the CellMap Segmentation Challenge"
+requires-python = ">=3.10"
+license = {text = "BSD-3-Clause"}
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "scipy",
+    "zarr>=2.16",
+    "monai>=1.3",
+]
+
+[project.optional-dependencies]
+gpu-flows = [
+    "topo",
+]
+dev = [
+    "pytest",
+    "ipython",
+]
+
+[tool.setuptools.packages.find]
+include = ["mia_em_loader*"]
+
+[tool.setuptools.package-data]
+mia_em_loader = ["py.typed"]
