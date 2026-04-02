@@ -1,3 +1,11 @@
+"""Generic 3D multi-label dataset for CellMap-style zarr EM data.
+
+Discovers annotated crops from multiscale zarr stores, samples random 3D
+patches, and returns raw EM + binary labels + annotation masks.
+
+Works with any set of label classes — pass your own list via ``target_classes``.
+"""
+
 import csv
 import hashlib
 import json
@@ -10,60 +18,10 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import zarr
-from scipy.ndimage import (
-    binary_dilation,
-    center_of_mass,
-    distance_transform_edt,
-    zoom as ndimage_zoom,
-)
+from scipy.ndimage import zoom as ndimage_zoom
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# 48 evaluated classes (from tested_classes.csv)
-# ---------------------------------------------------------------------------
-EVALUATED_CLASSES = [
-    "ecs", "pm", "mito_mem", "mito_lum", "mito_ribo",
-    "golgi_mem", "golgi_lum", "ves_mem", "ves_lum",
-    "endo_mem", "endo_lum", "lyso_mem", "lyso_lum",
-    "ld_mem", "ld_lum", "er_mem", "er_lum",
-    "eres_mem", "eres_lum", "ne_mem", "ne_lum",
-    "np_out", "np_in", "hchrom", "echrom", "nucpl",
-    "mt_out", "cyto", "mt_in",
-    "nuc", "golgi", "ves", "endo", "lyso", "ld", "eres",
-    "perox_mem", "perox_lum", "perox",
-    "mito", "er", "ne", "np", "chrom", "mt",
-    "cell", "er_mem_all", "ne_mem_all",
-]
-N_CLASSES = len(EVALUATED_CLASSES)
-
-INSTANCE_CLASSES = [
-    "nuc", "ves", "endo", "lyso", "ld", "perox", "mito", "mt", "cell",
-]
-
-# Instance classes that are in EVALUATED_CLASSES
-_EVALUATED_SET = set(EVALUATED_CLASSES)
-EVALUATED_INSTANCE_CLASSES = [c for c in INSTANCE_CLASSES if c in _EVALUATED_SET]
-N_INSTANCE_CLASSES = len(EVALUATED_INSTANCE_CLASSES)  # 9
-INSTANCE_CLASS_INDEX = {name: i for i, name in enumerate(EVALUATED_INSTANCE_CLASSES)}
-
-# Morphology groups + flow type for target generation and post-processing
-INSTANCE_CLASS_CONFIG = {
-    # Group 1: Convex — direct flows to center of mass
-    "nuc":   {"group": 1, "flow_type": "direct"},
-    "ves":   {"group": 1, "flow_type": "direct"},
-    "endo":  {"group": 1, "flow_type": "direct"},
-    "lyso":  {"group": 1, "flow_type": "direct"},
-    "ld":    {"group": 1, "flow_type": "direct"},
-    "perox": {"group": 1, "flow_type": "direct"},
-    # Group 2: Non-convex / elongated — diffusion-based flows (heat equation)
-    "cell":  {"group": 2, "flow_type": "diffusion", "diffusion_iters": 200,
-              "boundary_only": True, "boundary_width": 20},
-    "mito":  {"group": 2, "flow_type": "diffusion", "diffusion_iters": 200},
-    # Group 3: Thin — direct flows
-    "mt":    {"group": 3, "flow_type": "direct"},
-}
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +93,10 @@ class NormParams:
 
 
 def load_norms(csv_path: str) -> Dict[str, NormParams]:
-    """Load per-dataset normalization parameters from CSV."""
+    """Load per-dataset normalization parameters from CSV.
+
+    Expected CSV columns: dataset, min, max, inverted
+    """
     norms = {}
     with open(csv_path) as f:
         reader = csv.DictReader(f)
@@ -186,220 +147,38 @@ class CropInfo:
 
 
 # ---------------------------------------------------------------------------
-# Instance target helpers
-# ---------------------------------------------------------------------------
-
-
-def _generate_direct_flows(
-    flows: np.ndarray, ch_z: int, ch_y: int, ch_x: int,
-    instance_mask: np.ndarray, inst_ids: np.ndarray,
-) -> None:
-    """Generate direct unit vectors from each voxel to its instance's center of mass.
-
-    Works for convex shapes where center of mass is inside the object.
-    """
-    D, H, W = instance_mask.shape
-    coords = np.mgrid[0:D, 0:H, 0:W].astype(np.float32)
-
-    for inst_id in inst_ids:
-        if inst_id == 0:
-            continue
-        mask = (instance_mask == inst_id)
-        if mask.sum() == 0:
-            continue
-
-        com = np.array(center_of_mass(mask), dtype=np.float32)
-
-        dz = com[0] - coords[0]
-        dy = com[1] - coords[1]
-        dx = com[2] - coords[2]
-
-        mag = np.sqrt(dz ** 2 + dy ** 2 + dx ** 2)
-        mag = np.clip(mag, 1e-8, None)
-
-        flows[ch_z][mask] = (dz / mag)[mask]
-        flows[ch_y][mask] = (dy / mag)[mask]
-        flows[ch_x][mask] = (dx / mag)[mask]
-
-        # At center of mass: flow = 0 (the sink)
-        z0 = np.clip(int(round(com[0])), 0, D - 1)
-        y0 = np.clip(int(round(com[1])), 0, H - 1)
-        x0 = np.clip(int(round(com[2])), 0, W - 1)
-        if mask[z0, y0, x0]:
-            flows[ch_z][z0, y0, x0] = 0.0
-            flows[ch_y][z0, y0, x0] = 0.0
-            flows[ch_x][z0, y0, x0] = 0.0
-
-
-def _generate_diffusion_flows(
-    flows: np.ndarray, ch_z: int, ch_y: int, ch_x: int,
-    instance_mask: np.ndarray, inst_ids: np.ndarray,
-    n_iter: int = 200,
-    adaptive_iters: bool = True,
-    adaptive_factor: int = 6,
-    spatial_mask: Optional[np.ndarray] = None,
-) -> None:
-    """Generate diffusion-based (heat equation) flows for non-convex shapes.
-
-    For each instance (cropped to bounding box for speed):
-    1. Initialize scalar field with coordinate values
-    2. Diffuse iteratively within the instance mask
-    3. Take spatial gradient → flow direction
-
-    Per-instance loop guarantees no heat leaking between touching instances.
-
-    At annotation boundaries (where spatial_mask=0), the field is allowed to
-    diffuse freely (Neumann-like BC) so cut instances don't pile up against
-    the crop edge. At true background boundaries (spatial_mask=1, instance=0),
-    Dirichlet=0 is used so flow points inward.
-
-    Args:
-        adaptive_iters: If True, set iterations = adaptive_factor * max(bbox_extent)
-            per instance, capped by n_iter. Smaller instances get fewer iterations.
-        adaptive_factor: Multiplier for adaptive iteration count (default 6).
-        spatial_mask: [D, H, W] float/bool — 1 inside annotated region, 0 outside.
-            If None, Dirichlet=0 is used everywhere (original behavior).
-    """
-    D, H, W = instance_mask.shape
-
-    for inst_id in inst_ids:
-        if inst_id == 0:
-            continue
-        mask = (instance_mask == inst_id)
-        if mask.sum() == 0:
-            continue
-
-        # Crop to bounding box with padding for efficiency
-        where_mask = np.where(mask)
-        pad = 2
-        z0 = max(0, where_mask[0].min() - pad)
-        z1 = min(D, where_mask[0].max() + pad + 1)
-        y0 = max(0, where_mask[1].min() - pad)
-        y1 = min(H, where_mask[1].max() + pad + 1)
-        x0 = max(0, where_mask[2].min() - pad)
-        x1 = min(W, where_mask[2].max() + pad + 1)
-
-        crop_mask = mask[z0:z1, y0:y1, x0:x1]
-        cd, ch, cw = crop_mask.shape
-        crop_where = np.where(crop_mask)
-
-        # Build the update mask: voxels where the field is allowed to evolve.
-        # - Inside instance mask: always updated (the diffusion domain)
-        # - Outside annotation boundary (spatial_mask=0): also updated, so the
-        #   field diffuses freely into unannotated regions (Neumann-like BC at
-        #   the annotation edge — no heat sink for cut instances)
-        # - Annotated background (spatial_mask=1, instance=0): stays at 0
-        #   (Dirichlet BC — correct for natural instance boundaries)
-        if spatial_mask is not None:
-            crop_spatial = spatial_mask[z0:z1, y0:y1, x0:x1] > 0.5
-            # Update where: inside instance OR outside annotation
-            update_mask = crop_mask | ~crop_spatial
-        else:
-            update_mask = crop_mask
-
-        # Adaptive iteration count: scale with instance extent, cap at n_iter
-        if adaptive_iters:
-            max_extent = max(cd, ch, cw)
-            inst_n_iter = min(adaptive_factor * max_extent, n_iter)
-        else:
-            inst_n_iter = n_iter
-
-        inst_flows = np.zeros((3, cd, ch, cw), dtype=np.float64)
-
-        for axis in range(3):
-            # Initialize: coordinate values offset by crop origin
-            offsets = [z0, y0, x0]
-            field = np.zeros((cd, ch, cw), dtype=np.float64)
-            field[crop_mask] = (crop_where[axis] + offsets[axis]).astype(np.float64)
-
-            # Diffuse: field evolves inside the instance mask AND in
-            # unannotated regions. Annotated background stays at 0.
-            # Padded laplacian (edge mode) gives Neumann BC at array edges,
-            # preventing heat sink at the bounding box boundary.
-            for _ in range(inst_n_iter):
-                fp = np.pad(field, 1, mode='edge')
-                new_field = field.copy()
-
-                for ax in range(3):
-                    slc_f = [slice(1, -1)] * 3
-                    slc_b = [slice(1, -1)] * 3
-                    slc_f[ax] = slice(2, None)
-                    slc_b[ax] = slice(None, -2)
-
-                    laplacian = (
-                        fp[tuple(slc_f)]
-                        + fp[tuple(slc_b)]
-                        - 2.0 * field
-                    )
-                    new_field += (1.0 / 6.0) * laplacian
-
-                # Update instance voxels + unannotated region (free diffusion)
-                # Annotated background stays at 0 (Dirichlet)
-                field[update_mask] = new_field[update_mask]
-
-            # Gradient of diffused field = flow direction
-            inst_flows[axis] = np.gradient(field, axis=axis)
-
-        # Normalize to unit vectors
-        mag = np.sqrt(
-            inst_flows[0] ** 2 + inst_flows[1] ** 2 + inst_flows[2] ** 2
-        )
-        mag = np.clip(mag, 1e-8, None)
-
-        flows[ch_z][z0:z1, y0:y1, x0:x1][crop_mask] = (inst_flows[0] / mag)[crop_mask].astype(np.float32)
-        flows[ch_y][z0:z1, y0:y1, x0:x1][crop_mask] = (inst_flows[1] / mag)[crop_mask].astype(np.float32)
-        flows[ch_x][z0:z1, y0:y1, x0:x1][crop_mask] = (inst_flows[2] / mag)[crop_mask].astype(np.float32)
-
-
-def _compute_boundary_map(
-    instance_mask: np.ndarray, dilation_width: int = 2
-) -> np.ndarray:
-    """Inter-instance boundary map.
-
-    1.0 where adjacent voxels have different non-zero instance IDs.
-    Dilated by ``dilation_width`` voxels so boundaries are 2-4 voxels wide
-    (thin boundaries are harder to learn).
-    """
-    boundary = np.zeros(instance_mask.shape, dtype=np.float32)
-    for axis in range(instance_mask.ndim):
-        slc_a = [slice(None)] * instance_mask.ndim
-        slc_b = [slice(None)] * instance_mask.ndim
-        slc_a[axis] = slice(None, -1)
-        slc_b[axis] = slice(1, None)
-
-        a = instance_mask[tuple(slc_a)]
-        b = instance_mask[tuple(slc_b)]
-
-        is_bnd = (a != b) & (a > 0) & (b > 0)
-        boundary[tuple(slc_a)] = np.maximum(boundary[tuple(slc_a)], is_bnd)
-        boundary[tuple(slc_b)] = np.maximum(boundary[tuple(slc_b)], is_bnd)
-
-    if dilation_width > 1:
-        struct = np.ones([3] * instance_mask.ndim)
-        boundary = binary_dilation(
-            boundary > 0, struct, iterations=dilation_width - 1
-        ).astype(np.float32)
-
-    return boundary
-
-
-# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
 class CellMapDataset3D(Dataset):
-    """3D multi-label dataset for the CellMap Segmentation Challenge.
+    """Generic 3D multi-label dataset for CellMap-style zarr EM data.
 
     Discovers all annotated crops from zarr stores, and samples random 3D
     patches returning raw EM + binary labels for all target classes + an
     annotation mask indicating which classes were annotated in the crop.
+
+    Args:
+        data_root: Root directory containing dataset directories.
+        norms_csv: Path to CSV with per-dataset normalization params
+            (columns: dataset, min, max, inverted).
+        target_classes: List of class names to load (must match zarr subdirectory
+            names under each crop). Required.
+        target_resolution: Target isotropic resolution in nm.
+        patch_size: Output patch dimensions in voxels (D, H, W).
+        samples_per_epoch: Virtual epoch length.
+        min_crop_voxels: Minimum crop extent in voxels at target resolution.
+        max_resolution_ratio: Max ratio between available and target resolution.
+        cache_dir: Directory for caching discovered crop metadata.
+        seed: Random seed.
+        transforms: Augmentation callable(raw, labels) -> (raw, labels).
+        skip_datasets: Dataset names to skip during discovery.
     """
 
     def __init__(
         self,
-        data_root: str = "/nrs/cellmap/data",
-        norms_csv: str = None,
-        target_classes: List[str] = None,
+        data_root: str,
+        norms_csv: str,
+        target_classes: List[str],
         target_resolution: float = 8.0,
         patch_size: Tuple[int, int, int] = (128, 128, 128),
         samples_per_epoch: int = 1000,
@@ -409,16 +188,9 @@ class CellMapDataset3D(Dataset):
         seed: int = 42,
         transforms=None,
         skip_datasets: List[str] = None,
-        instance_mode: bool = False,
-        diffusion_iters: int = 200,
-        adaptive_iters: bool = True,
-        adaptive_factor: int = 6,
-        instance_class_config: Optional[dict] = None,
-        gpu_flows: bool = False,
-        instance_classes: Optional[List[str]] = None,
     ):
         self.data_root = data_root
-        self.target_classes = target_classes or EVALUATED_CLASSES
+        self.target_classes = list(target_classes)
         self.n_classes = len(self.target_classes)
         self.target_resolution = target_resolution
         self.patch_size = np.array(patch_size)
@@ -429,32 +201,11 @@ class CellMapDataset3D(Dataset):
         self.rng = np.random.default_rng(seed)
         self.transforms = transforms
         self.skip_datasets = set(skip_datasets or [])
-        self.instance_mode = instance_mode
-        self.diffusion_iters = diffusion_iters
-        self.adaptive_iters = adaptive_iters
-        self.adaptive_factor = adaptive_factor
-        self.instance_class_config = instance_class_config
-        self.gpu_flows = gpu_flows and instance_mode  # only meaningful in instance mode
-
-        # Instance class subset (for cascade stages with fewer than 9 classes)
-        self.instance_classes = instance_classes or list(EVALUATED_INSTANCE_CLASSES)
-        self.n_instance_classes = len(self.instance_classes)
-
-        # Instance class mapping (for instance_mode)
-        if instance_mode:
-            self.instance_class_to_idx = {
-                c: i for i, c in enumerate(self.instance_classes)
-            }
 
         # Build class name -> index lookup
         self.class_to_idx = {c: i for i, c in enumerate(self.target_classes)}
 
         # Load normalization
-        if norms_csv is None:
-            raise ValueError(
-                "norms_csv is required — path to a CSV with per-dataset "
-                "normalization parameters (columns: dataset, min, max, inverted)"
-            )
         self.norms = load_norms(norms_csv)
 
         # Cache directory for discovered crops
@@ -515,7 +266,7 @@ class CellMapDataset3D(Dataset):
                 crop.norm_params = self.norms[crop.dataset_name]
             return
 
-        logger.info("No cache found, running full discovery (this takes ~8 min)...")
+        logger.info("No cache found, running full discovery...")
         self._discover_crops()
 
         os.makedirs(self.cache_dir, exist_ok=True)
@@ -746,9 +497,6 @@ class CellMapDataset3D(Dataset):
         raw_patch = raw_patch[:D, :H, :W]
 
         # --- Build spatial annotation mask from crop bounding box ---
-        # Compute which output voxels fall inside the annotated crop region.
-        # The crop covers [crop_origin, crop_end) in world coords; we need
-        # to map that to output-patch voxel coordinates [0..D, 0..H, 0..W].
         target_res = self.target_resolution
         crop_start_in_patch = np.maximum(
             np.round((crop_origin - sample_origin) / target_res).astype(int), 0
@@ -769,11 +517,6 @@ class CellMapDataset3D(Dataset):
         # --- Read labels (padded with zeros outside crop boundary) ---
         labels = np.zeros((self.n_classes, D, H, W), dtype=np.float32)
         annotated_mask = np.zeros(self.n_classes, dtype=bool)
-
-        # Instance mode: also collect raw integer instance IDs
-        if self.instance_mode:
-            instance_ids = np.zeros((self.n_instance_classes, D, H, W), dtype=np.int32)
-            instance_annotated = np.zeros(self.n_instance_classes, dtype=bool)
 
         for cls_name, cls_idx in self.class_to_idx.items():
             if cls_name not in crop.annotated_classes:
@@ -821,15 +564,6 @@ class CellMapDataset3D(Dataset):
             # Binarize: >0 and !=255 means present
             label_binary = ((label_patch > 0) & (label_patch != 255)).astype(np.float32)
 
-            # Instance mode: preserve raw integer IDs for instance classes
-            # (before binarization, zeroing out the 255 exclusion marker)
-            is_instance_cls = (
-                self.instance_mode and cls_name in self.instance_class_to_idx
-            )
-            if is_instance_cls:
-                label_int = label_patch.copy()
-                label_int[label_patch == 255] = 0  # exclude marker → background
-
             # Place label into full patch-sized canvas, then resample
             # For small crops, label only covers part of the patch
             if label_binary.shape != tuple(cls_patch_vox):
@@ -851,12 +585,6 @@ class CellMapDataset3D(Dataset):
                 canvas[slices] = label_binary[trimmed]
                 label_binary = canvas
 
-                # Same placement for integer instance IDs
-                if is_instance_cls:
-                    int_canvas = np.zeros(tuple(cls_patch_vox), dtype=np.int32)
-                    int_canvas[slices] = label_int[trimmed]
-                    label_int = int_canvas
-
             # Resample to patch_size
             if label_binary.shape != (D, H, W):
                 zoom_factors = (
@@ -865,64 +593,10 @@ class CellMapDataset3D(Dataset):
                     W / label_binary.shape[2],
                 )
                 label_binary = ndimage_zoom(label_binary, zoom_factors, order=0)
-                if is_instance_cls:
-                    label_int = ndimage_zoom(label_int, zoom_factors, order=0)
 
             labels[cls_idx] = label_binary[:D, :H, :W]
 
-            # Store instance IDs
-            if is_instance_cls:
-                inst_idx = self.instance_class_to_idx[cls_name]
-                instance_ids[inst_idx] = label_int[:D, :H, :W]
-                instance_annotated[inst_idx] = True
-
-        if self.instance_mode:
-            return raw_patch, labels, annotated_mask, spatial_mask, instance_ids, instance_annotated
         return raw_patch, labels, annotated_mask, spatial_mask
-
-    # ------------------------------------------------------------------
-    # Instance target generation
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _compute_flow_targets(
-        instance_ids: np.ndarray,
-        class_names: Optional[List[str]] = None,
-        class_config: Optional[dict] = None,
-        diffusion_iters: int = 200,
-        adaptive_iters: bool = True,
-        adaptive_factor: int = 6,
-        spatial_mask: Optional[np.ndarray] = None,
-    ) -> tuple:
-        """Compute per-class flow targets — delegates to topo.compute_flow_targets.
-
-        Args:
-            instance_ids: [N_INSTANCE, D, H, W] int32 — raw instance IDs.
-            class_names: List of instance class names matching instance_ids channels.
-            class_config: Per-class config dict (defaults to INSTANCE_CLASS_CONFIG).
-            diffusion_iters: Max diffusion iterations for mito (cap for adaptive).
-            adaptive_iters: Scale iterations with instance extent (default True).
-            adaptive_factor: Multiplier for adaptive count (default 6).
-            spatial_mask: [D, H, W] float/bool — 1 inside annotated region.
-
-        Returns:
-            flows: [N*3, D, H, W] float32 — per-class flow unit vectors.
-            class_fg: [N, D, H, W] float32 — per-class foreground masks.
-        """
-        from topo import compute_flow_targets
-
-        if class_config is None:
-            class_config = INSTANCE_CLASS_CONFIG
-
-        return compute_flow_targets(
-            instance_ids,
-            class_names=class_names,
-            class_config=class_config,
-            diffusion_iters=diffusion_iters,
-            adaptive_iters=adaptive_iters,
-            adaptive_factor=adaptive_factor,
-            spatial_mask=spatial_mask,
-        )
 
     # ------------------------------------------------------------------
     # Dataset interface
@@ -937,88 +611,29 @@ class CellMapDataset3D(Dataset):
         If idx < len(self.crops), it is used as a crop index (for use with
         ClassBalancedSampler). Otherwise a random crop is chosen.
 
-        Augmentations (if set via `self.transforms`) are applied here inside
-        the DataLoader worker process, allowing parallel augmentation across
-        workers and keeping the GPU fed continuously.
-
         Returns:
             raw: torch.Tensor [1, D, H, W] float32
             labels: torch.Tensor [n_classes, D, H, W] float32
-            annotated_mask: torch.Tensor [n_classes] bool — which classes annotated
-            spatial_mask: torch.Tensor [1, D, H, W] float32 — 1 inside GT crop
+            annotated_mask: torch.Tensor [n_classes] bool
+            spatial_mask: torch.Tensor [1, D, H, W] float32
             crop_name: str, e.g. "jrc_hela-2/crop1"
-
-        When instance_mode=True, additionally returns:
-            flow_targets: torch.Tensor [N*3, D, H, W] float32 — per-class flow vectors
-            class_fg: torch.Tensor [N, D, H, W] float32 — per-class foreground masks
-            instance_ids: torch.Tensor [N, D, H, W] int32 — raw instance IDs
-            instance_ann: torch.Tensor [N] bool — which classes are annotated
         """
         if idx < len(self.crops):
             crop = self.crops[idx]
         else:
             crop = self.crops[self.rng.integers(len(self.crops))]
 
-        if self.instance_mode:
-            raw, labels, annotated_mask, spatial_mask, instance_ids, instance_annotated = (
-                self._extract_patch(crop)
-            )
-        else:
-            raw, labels, annotated_mask, spatial_mask = self._extract_patch(crop)
+        raw, labels, annotated_mask, spatial_mask = self._extract_patch(crop)
 
         raw = torch.from_numpy(raw[np.newaxis])  # [1, D, H, W]
         labels = torch.from_numpy(labels)
         annotated_mask = torch.from_numpy(annotated_mask)
         spatial_mask = torch.from_numpy(spatial_mask[np.newaxis])  # [1, D, H, W]
 
-        # Apply augmentations inside worker
         if self.transforms is not None:
-            if self.instance_mode:
-                # Concatenate binary labels + integer instance IDs for joint
-                # spatial augmentation. First 48 channels are binary labels,
-                # last 10 channels are integer instance IDs.
-                instance_ids_t = torch.from_numpy(instance_ids.astype(np.float32))
-                combined = torch.cat([labels, instance_ids_t], dim=0)
-                raw, combined = self.transforms(
-                    raw, combined, n_binary_channels=self.n_classes
-                )
-                labels = combined[:self.n_classes]
-                instance_ids = combined[self.n_classes:].round().long().numpy()
-            else:
-                raw, labels = self.transforms(raw, labels)
+            raw, labels = self.transforms(raw, labels)
 
         crop_name = f"{crop.dataset_name}/{crop.crop_id}"
-
-        if self.instance_mode:
-            instance_ids_t = torch.from_numpy(instance_ids.astype(np.int32))
-            instance_ann_t = torch.from_numpy(instance_annotated)
-
-            if self.gpu_flows:
-                # Skip CPU flow computation — return instance IDs for GPU computation
-                # Tuple positions 5,6 are instance_ids and instance_ann (no flows/class_fg)
-                return (
-                    raw, labels, annotated_mask, spatial_mask, crop_name,
-                    instance_ids_t, instance_ann_t,
-                )
-
-            # CPU flow computation (original path)
-            sp_np = spatial_mask.squeeze(0).numpy() if isinstance(spatial_mask, torch.Tensor) else spatial_mask[0]
-            flows, class_fg = self._compute_flow_targets(
-                instance_ids,
-                class_names=self.instance_classes,
-                class_config=self.instance_class_config,
-                diffusion_iters=self.diffusion_iters,
-                adaptive_iters=self.adaptive_iters,
-                adaptive_factor=self.adaptive_factor,
-                spatial_mask=sp_np,
-            )
-            flows_t = torch.from_numpy(flows)        # [N*3, D, H, W]
-            class_fg_t = torch.from_numpy(class_fg)  # [N, D, H, W]
-            return (
-                raw, labels, annotated_mask, spatial_mask, crop_name,
-                flows_t, class_fg_t,
-                instance_ids_t, instance_ann_t,
-            )
 
         return raw, labels, annotated_mask, spatial_mask, crop_name
 
