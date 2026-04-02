@@ -3,6 +3,9 @@
 Discovers annotated crops from multiscale zarr stores, samples random 3D
 patches, and returns raw EM + binary labels + annotation masks.
 
+Uses tensorstore for array I/O and reads OME-NGFF metadata directly from
+.zattrs/.zarray JSON files (tensorstore doesn't support group-level attrs).
+
 Works with any set of label classes — pass your own list via ``target_classes``.
 """
 
@@ -16,8 +19,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import tensorstore as ts
 import torch
-import zarr
 from scipy.ndimage import zoom as ndimage_zoom
 from torch.utils.data import Dataset
 
@@ -25,26 +28,46 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Zarr metadata helpers
+# Zarr metadata helpers (read JSON directly, no zarr dependency)
 # ---------------------------------------------------------------------------
 
 def get_scale_info(zarr_grp_path: str):
-    """Read multiscale metadata from a zarr group.
+    """Read multiscale metadata from a zarr group's .zattrs.
 
     Returns:
         offsets: dict mapping scale path -> [z, y, x] translation (world nm)
         resolutions: dict mapping scale path -> [z, y, x] voxel size (nm)
         shapes: dict mapping scale path -> volume shape (voxels)
     """
-    grp = zarr.open(zarr_grp_path, mode="r")
-    attrs = grp.attrs
+    zattrs_path = os.path.join(zarr_grp_path, ".zattrs")
+    with open(zattrs_path) as f:
+        attrs = json.load(f)
+
     offsets, resolutions, shapes = {}, {}, {}
     for scale in attrs["multiscales"][0]["datasets"]:
         path = scale["path"]
         resolutions[path] = scale["coordinateTransformations"][0]["scale"]
         offsets[path] = scale["coordinateTransformations"][1]["translation"]
-        shapes[path] = grp[path].shape
+        shapes[path] = _read_zarr_array_shape(os.path.join(zarr_grp_path, path))
     return offsets, resolutions, shapes
+
+
+def _read_zarr_array_shape(zarr_array_path: str) -> Tuple[int, ...]:
+    """Read the shape of a zarr array from its .zarray metadata."""
+    zarray_path = os.path.join(zarr_array_path, ".zarray")
+    with open(zarray_path) as f:
+        meta = json.load(f)
+    return tuple(meta["shape"])
+
+
+def _open_tensorstore(zarr_array_path: str) -> ts.TensorStore:
+    """Open a zarr array with tensorstore for reading."""
+    return ts.open({
+        "driver": "zarr",
+        "kvstore": {"driver": "file", "path": zarr_array_path},
+        "open": True,
+        "context": {"cache_pool": {"total_bytes_limit": 100_000_000}},
+    }).result()
 
 
 def get_raw_path(em_base: str) -> Optional[str]:
@@ -156,6 +179,8 @@ class CellMapDataset3D(Dataset):
     Discovers all annotated crops from zarr stores, and samples random 3D
     patches returning raw EM + binary labels for all target classes + an
     annotation mask indicating which classes were annotated in the crop.
+
+    Uses tensorstore for array reads (better caching and async I/O).
 
     Args:
         data_root: Root directory containing dataset directories.
@@ -424,6 +449,12 @@ class CellMapDataset3D(Dataset):
             raw = 1.0 - raw
         return raw
 
+    @staticmethod
+    def _ts_read(zarr_array_path: str, slices: Tuple[slice, ...]) -> np.ndarray:
+        """Read a slice from a zarr array using tensorstore."""
+        store = _open_tensorstore(zarr_array_path)
+        return store[slices].read().result()
+
     def _extract_patch(self, crop: CropInfo):
         """Extract a random 3D patch from a crop, resampled to isotropic target_resolution.
 
@@ -474,17 +505,15 @@ class CellMapDataset3D(Dataset):
         # Update sample_origin to match what we actually read (after clamping)
         sample_origin = raw_off + raw_start_vox * raw_res
 
-        raw_arr = zarr.open(
-            os.path.join(crop.raw_zarr_path, crop.raw_scale_path), mode="r"
+        raw_patch = self._ts_read(
+            os.path.join(crop.raw_zarr_path, crop.raw_scale_path),
+            (
+                slice(int(raw_start_vox[0]), int(raw_end_vox[0])),
+                slice(int(raw_start_vox[1]), int(raw_end_vox[1])),
+                slice(int(raw_start_vox[2]), int(raw_end_vox[2])),
+            ),
         )
-        raw_patch = np.array(
-            raw_arr[
-                raw_start_vox[0]:raw_end_vox[0],
-                raw_start_vox[1]:raw_end_vox[1],
-                raw_start_vox[2]:raw_end_vox[2],
-            ]
-        )
-        raw_patch = self._normalize_raw(raw_patch, crop.norm_params)
+        raw_patch = self._normalize_raw(np.asarray(raw_patch), crop.norm_params)
 
         # Resample raw to isotropic patch_size if needed (anisotropic resolution)
         if raw_patch.shape != (D, H, W):
@@ -544,16 +573,15 @@ class CellMapDataset3D(Dataset):
                 continue
 
             try:
-                label_arr = zarr.open(
-                    os.path.join(ci.zarr_path, ci.scale_path), mode="r"
+                label_patch = self._ts_read(
+                    os.path.join(ci.zarr_path, ci.scale_path),
+                    (
+                        slice(int(cls_start_vox[0]), int(cls_end_vox[0])),
+                        slice(int(cls_start_vox[1]), int(cls_end_vox[1])),
+                        slice(int(cls_start_vox[2]), int(cls_end_vox[2])),
+                    ),
                 )
-                label_patch = np.array(
-                    label_arr[
-                        cls_start_vox[0]:cls_end_vox[0],
-                        cls_start_vox[1]:cls_end_vox[1],
-                        cls_start_vox[2]:cls_end_vox[2],
-                    ]
-                )
+                label_patch = np.asarray(label_patch)
             except Exception as e:
                 logger.warning(
                     f"Failed to read label {cls_name} for "
