@@ -1,23 +1,17 @@
 """mia_em_loader - Generic 3D multi-label EM data loading for CellMap-style zarr data.
 
-Provides a PyTorch Dataset that discovers annotated crops from multiscale zarr
-stores, samples random 3D patches, and returns raw EM + binary labels.
-
-Works with any set of label classes — no hardcoded class lists.
+Provides a PyTorch Dataset that loads patches from a pre-built CropDatabase.
+Discovery is done separately via ``discover_crops``.
 """
 
-from .dataset import (
-    CellMapDataset3D,
-    # Data structures
+from .models import (
     NormParams,
     ClassInfo,
     CropInfo,
-    # Zarr helpers
-    get_scale_info,
-    get_raw_path,
-    find_scale_for_resolution,
-    load_norms,
+    CropDatabase,
 )
+from .dataset import CellMapDataset3D
+from .discover import discover_crops
 from .sampler import ClassBalancedSampler
 
 try:

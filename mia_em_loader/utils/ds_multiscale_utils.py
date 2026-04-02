@@ -1,11 +1,9 @@
 """Utilities for reading OME-NGFF multiscale zarr metadata and arrays."""
 
-import csv
 import json
 import logging
 import os
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import zarr
@@ -96,32 +94,3 @@ def get_raw_path(em_base: str) -> Optional[str]:
     if os.path.isdir(uint16_path):
         return uint16_path
     return None
-
-
-# ---------------------------------------------------------------------------
-# Normalization
-# ---------------------------------------------------------------------------
-
-@dataclass
-class NormParams:
-    min_val: float
-    max_val: float
-    inverted: bool
-
-
-def load_norms(csv_path: str) -> Dict[str, NormParams]:
-    """Load per-dataset normalization parameters from CSV.
-
-    Expected CSV columns: dataset, min, max, inverted
-    """
-    norms = {}
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            name = row["dataset"].strip()
-            norms[name] = NormParams(
-                min_val=float(row["min"]),
-                max_val=float(row["max"]),
-                inverted=row["inverted"].strip() == "True",
-            )
-    return norms
