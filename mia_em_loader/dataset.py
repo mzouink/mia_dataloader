@@ -3,13 +3,12 @@
 Discovers annotated crops from multiscale zarr stores, samples random 3D
 patches, and returns raw EM + binary labels + annotation masks.
 
-Uses tensorstore for array I/O and reads OME-NGFF metadata directly from
-.zattrs/.zarray JSON files (tensorstore doesn't support group-level attrs).
+Uses zarr for array I/O and reads OME-NGFF metadata directly from
+.zattrs/.zarray JSON files.
 
 Works with any set of label classes — pass your own list via ``target_classes``.
 """
 
-import csv
 import hashlib
 import json
 import logging
@@ -19,118 +18,20 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import tensorstore as ts
 import torch
 from scipy.ndimage import zoom as ndimage_zoom
 from torch.utils.data import Dataset
 
+from .utils import (
+    get_scale_info,
+    find_scale_for_resolution,
+    get_raw_path,
+    load_norms,
+    zarr_read,
+    NormParams,
+)
+
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Zarr metadata helpers (read JSON directly, no zarr dependency)
-# ---------------------------------------------------------------------------
-
-def get_scale_info(zarr_grp_path: str):
-    """Read multiscale metadata from a zarr group's .zattrs.
-
-    Returns:
-        offsets: dict mapping scale path -> [z, y, x] translation (world nm)
-        resolutions: dict mapping scale path -> [z, y, x] voxel size (nm)
-        shapes: dict mapping scale path -> volume shape (voxels)
-    """
-    zattrs_path = os.path.join(zarr_grp_path, ".zattrs")
-    with open(zattrs_path) as f:
-        attrs = json.load(f)
-
-    offsets, resolutions, shapes = {}, {}, {}
-    for scale in attrs["multiscales"][0]["datasets"]:
-        path = scale["path"]
-        resolutions[path] = scale["coordinateTransformations"][0]["scale"]
-        offsets[path] = scale["coordinateTransformations"][1]["translation"]
-        shapes[path] = _read_zarr_array_shape(os.path.join(zarr_grp_path, path))
-    return offsets, resolutions, shapes
-
-
-def _read_zarr_array_shape(zarr_array_path: str) -> Tuple[int, ...]:
-    """Read the shape of a zarr array from its .zarray metadata."""
-    zarray_path = os.path.join(zarr_array_path, ".zarray")
-    with open(zarray_path) as f:
-        meta = json.load(f)
-    return tuple(meta["shape"])
-
-
-def _open_tensorstore(zarr_array_path: str) -> ts.TensorStore:
-    """Open a zarr array with tensorstore for reading."""
-    return ts.open({
-        "driver": "zarr",
-        "kvstore": {"driver": "file", "path": zarr_array_path},
-        "open": True,
-        "context": {"cache_pool": {"total_bytes_limit": 100_000_000}},
-    }).result()
-
-
-def get_raw_path(em_base: str) -> Optional[str]:
-    """Select fibsem-uint8 if available, else fibsem-uint16."""
-    uint8_path = os.path.join(em_base, "fibsem-uint8")
-    uint16_path = os.path.join(em_base, "fibsem-uint16")
-    if os.path.isdir(uint8_path):
-        return uint8_path
-    if os.path.isdir(uint16_path):
-        return uint16_path
-    return None
-
-
-def find_scale_for_resolution(
-    zarr_grp_path: str,
-    target_res: float,
-    max_ratio: float = 2.0,
-) -> Optional[Tuple[str, List[float], List[float], Tuple[int, ...]]]:
-    """Find the scale level closest to target_res (matching on Y axis).
-
-    Returns (scale_path, resolution, offset, shape) or None.
-    """
-    offsets, resolutions, shapes = get_scale_info(zarr_grp_path)
-    candidates = []
-    for name, res in resolutions.items():
-        y_res = res[1]
-        ratio = max(y_res / target_res, target_res / y_res)
-        if ratio <= max_ratio:
-            candidates.append((abs(y_res - target_res), name, res, offsets[name], shapes[name]))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[0])
-    _, best_path, best_res, best_off, best_shape = candidates[0]
-    return best_path, best_res, best_off, best_shape
-
-
-# ---------------------------------------------------------------------------
-# Normalization
-# ---------------------------------------------------------------------------
-
-@dataclass
-class NormParams:
-    min_val: float
-    max_val: float
-    inverted: bool
-
-
-def load_norms(csv_path: str) -> Dict[str, NormParams]:
-    """Load per-dataset normalization parameters from CSV.
-
-    Expected CSV columns: dataset, min, max, inverted
-    """
-    norms = {}
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            name = row["dataset"].strip()
-            norms[name] = NormParams(
-                min_val=float(row["min"]),
-                max_val=float(row["max"]),
-                inverted=row["inverted"].strip() == "True",
-            )
-    return norms
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +81,7 @@ class CellMapDataset3D(Dataset):
     patches returning raw EM + binary labels for all target classes + an
     annotation mask indicating which classes were annotated in the crop.
 
-    Uses tensorstore for array reads (better caching and async I/O).
+    Uses zarr for array reads.
 
     Args:
         data_root: Root directory containing dataset directories.
@@ -189,7 +90,11 @@ class CellMapDataset3D(Dataset):
         target_classes: List of class names to load (must match zarr subdirectory
             names under each crop). Required.
         target_resolution: Target isotropic resolution in nm.
-        patch_size: Output patch dimensions in voxels (D, H, W).
+        input_size: Raw input patch dimensions in voxels (D, H, W).
+        output_size: Label output patch dimensions in voxels (D, H, W).
+            If None, defaults to input_size (no context padding).
+            Must be <= input_size per axis. Labels and spatial_mask are
+            cropped to the center output_size region of the input patch.
         samples_per_epoch: Virtual epoch length.
         min_crop_voxels: Minimum crop extent in voxels at target resolution.
         max_resolution_ratio: Max ratio between available and target resolution.
@@ -205,7 +110,8 @@ class CellMapDataset3D(Dataset):
         norms_csv: str,
         target_classes: List[str],
         target_resolution: float = 8.0,
-        patch_size: Tuple[int, int, int] = (128, 128, 128),
+        input_size: Tuple[int, int, int] = (128, 128, 128),
+        output_size: Tuple[int, int, int] = None,
         samples_per_epoch: int = 1000,
         min_crop_voxels: int = 32,
         max_resolution_ratio: float = 2.0,
@@ -218,8 +124,17 @@ class CellMapDataset3D(Dataset):
         self.target_classes = list(target_classes)
         self.n_classes = len(self.target_classes)
         self.target_resolution = target_resolution
-        self.patch_size = np.array(patch_size)
-        self.patch_world = self.patch_size * target_resolution
+        self.input_size = np.array(input_size)
+        self.output_size = np.array(output_size if output_size is not None else input_size)
+        if np.any(self.output_size > self.input_size):
+            raise ValueError(
+                f"output_size {tuple(self.output_size)} must be <= input_size "
+                f"{tuple(self.input_size)} on every axis"
+            )
+        self.input_world = self.input_size * target_resolution
+        self.output_world = self.output_size * target_resolution
+        # Offset from input origin to output origin in world coords
+        self.output_offset_world = (self.input_world - self.output_world) / 2
         self.samples_per_epoch = samples_per_epoch
         self.min_crop_voxels = min_crop_voxels
         self.max_resolution_ratio = max_resolution_ratio
@@ -246,7 +161,8 @@ class CellMapDataset3D(Dataset):
             f"CellMapDataset3D: {len(self.crops)} crops, "
             f"{self.n_classes} classes, "
             f"target_resolution={target_resolution}nm, "
-            f"patch_size={tuple(self.patch_size)}"
+            f"input_size={tuple(self.input_size)}, "
+            f"output_size={tuple(self.output_size)}"
         )
         if len(self.crops) == 0:
             raise RuntimeError(
@@ -450,51 +366,52 @@ class CellMapDataset3D(Dataset):
         return raw
 
     @staticmethod
-    def _ts_read(zarr_array_path: str, slices: Tuple[slice, ...]) -> np.ndarray:
-        """Read a slice from a zarr array using tensorstore."""
-        store = _open_tensorstore(zarr_array_path)
-        return store[slices].read().result()
+    def _zarr_read(zarr_array_path: str, slices: Tuple[slice, ...]) -> np.ndarray:
+        """Read a slice from a zarr array."""
+        return zarr_read(zarr_array_path, slices)
 
     def _extract_patch(self, crop: CropInfo):
         """Extract a random 3D patch from a crop, resampled to isotropic target_resolution.
 
-        All reads are done in world coordinates, then resampled to
-        patch_size voxels at target_resolution. This correctly handles
-        anisotropic raw/label resolutions.
+        Raw is read at input_size. Labels and spatial_mask are produced at
+        output_size, corresponding to the center region of the raw patch.
 
         Returns:
-            raw: np.ndarray [D, H, W] float32 in [0, 1]
-            labels: np.ndarray [n_classes, D, H, W] float32 binary
+            raw: np.ndarray [iD, iH, iW] float32 in [0, 1]
+            labels: np.ndarray [n_classes, oD, oH, oW] float32 binary
             annotated_mask: np.ndarray [n_classes] bool — which classes are annotated
-            spatial_mask: np.ndarray [D, H, W] float32 — 1 inside GT crop, 0 outside
+            spatial_mask: np.ndarray [oD, oH, oW] float32 — 1 inside GT crop, 0 outside
+            metadata: dict with provenance/debug info
         """
-        D, H, W = self.patch_size
+        iD, iH, iW = self.input_size
+        oD, oH, oW = self.output_size
         crop_origin = np.array(crop.crop_origin_world)
         crop_extent = np.array(crop.crop_extent_world)
         crop_end = crop_origin + crop_extent
         crop_center = crop_origin + crop_extent / 2
 
-        # Whether the crop is smaller than the patch in any dimension
-        small_crop = np.any(crop_extent < self.patch_world)
+        # Whether the crop is smaller than the input patch in any dimension
+        small_crop = np.any(crop_extent < self.input_world)
 
         if small_crop:
             # Center the patch on the crop so raw EM context surrounds the GT
-            sample_origin = crop_center - self.patch_world / 2
+            sample_origin = crop_center - self.input_world / 2
         else:
-            # Random origin within valid range
-            max_origin = crop_end - self.patch_world
+            # Random origin within valid range (ensure output region fits in crop)
+            max_origin = crop_end - self.output_world - self.output_offset_world
+            min_origin = crop_origin - self.output_offset_world
             sample_origin = np.array([
-                self.rng.uniform(crop_origin[i], max_origin[i])
+                self.rng.uniform(min_origin[i], max_origin[i])
                 for i in range(3)
             ])
 
-        # --- Read raw (always full patch, never padded black) ---
+        # --- Read raw (always full input patch, never padded black) ---
         raw_res = np.array(crop.raw_resolution)
         raw_off = np.array(crop.raw_offset_world)
         raw_shape = np.array(crop.raw_shape)
 
-        # How many raw voxels cover the target world extent per axis
-        raw_read_vox = np.ceil(self.patch_world / raw_res).astype(int)
+        # How many raw voxels cover the input world extent per axis
+        raw_read_vox = np.ceil(self.input_world / raw_res).astype(int)
 
         raw_start_vox = np.round((sample_origin - raw_off) / raw_res).astype(int)
         # Clamp so the full read window stays within the raw volume
@@ -505,7 +422,7 @@ class CellMapDataset3D(Dataset):
         # Update sample_origin to match what we actually read (after clamping)
         sample_origin = raw_off + raw_start_vox * raw_res
 
-        raw_patch = self._ts_read(
+        raw_patch = self._zarr_read(
             os.path.join(crop.raw_zarr_path, crop.raw_scale_path),
             (
                 slice(int(raw_start_vox[0]), int(raw_end_vox[0])),
@@ -515,36 +432,40 @@ class CellMapDataset3D(Dataset):
         )
         raw_patch = self._normalize_raw(np.asarray(raw_patch), crop.norm_params)
 
-        # Resample raw to isotropic patch_size if needed (anisotropic resolution)
-        if raw_patch.shape != (D, H, W):
+        # Resample raw to isotropic input_size if needed (anisotropic resolution)
+        if raw_patch.shape != (iD, iH, iW):
             zoom_factors = (
-                D / raw_patch.shape[0],
-                H / raw_patch.shape[1],
-                W / raw_patch.shape[2],
+                iD / raw_patch.shape[0],
+                iH / raw_patch.shape[1],
+                iW / raw_patch.shape[2],
             )
             raw_patch = ndimage_zoom(raw_patch, zoom_factors, order=1)
-        raw_patch = raw_patch[:D, :H, :W]
+        raw_patch = raw_patch[:iD, :iH, :iW]
+
+        # --- Output region: center of the input patch ---
+        # output_origin is the world coordinate of the output region start
+        output_origin = sample_origin + self.output_offset_world
 
         # --- Build spatial annotation mask from crop bounding box ---
         target_res = self.target_resolution
-        crop_start_in_patch = np.maximum(
-            np.round((crop_origin - sample_origin) / target_res).astype(int), 0
+        crop_start_in_output = np.maximum(
+            np.round((crop_origin - output_origin) / target_res).astype(int), 0
         )
-        crop_end_in_patch = np.minimum(
-            np.round((crop_end - sample_origin) / target_res).astype(int),
-            self.patch_size,
+        crop_end_in_output = np.minimum(
+            np.round((crop_end - output_origin) / target_res).astype(int),
+            self.output_size,
         )
 
         # 3-D spatial mask: 1 inside crop, 0 outside
-        spatial_mask = np.zeros((D, H, W), dtype=np.float32)
+        spatial_mask = np.zeros((oD, oH, oW), dtype=np.float32)
         spatial_mask[
-            crop_start_in_patch[0]:crop_end_in_patch[0],
-            crop_start_in_patch[1]:crop_end_in_patch[1],
-            crop_start_in_patch[2]:crop_end_in_patch[2],
+            crop_start_in_output[0]:crop_end_in_output[0],
+            crop_start_in_output[1]:crop_end_in_output[1],
+            crop_start_in_output[2]:crop_end_in_output[2],
         ] = 1.0
 
-        # --- Read labels (padded with zeros outside crop boundary) ---
-        labels = np.zeros((self.n_classes, D, H, W), dtype=np.float32)
+        # --- Read labels at output_size (padded with zeros outside crop) ---
+        labels = np.zeros((self.n_classes, oD, oH, oW), dtype=np.float32)
         annotated_mask = np.zeros(self.n_classes, dtype=bool)
 
         for cls_name, cls_idx in self.class_to_idx.items():
@@ -557,11 +478,11 @@ class CellMapDataset3D(Dataset):
             cls_res = np.array(ci.resolution)
             cls_off = np.array(ci.offset_world)
 
-            # How many class voxels cover the target world extent
-            cls_patch_vox = np.ceil(self.patch_world / cls_res).astype(int)
+            # How many class voxels cover the output world extent
+            cls_patch_vox = np.ceil(self.output_world / cls_res).astype(int)
             cls_patch_vox = np.maximum(cls_patch_vox, 1)
 
-            cls_start_vox = np.round((sample_origin - cls_off) / cls_res).astype(int)
+            cls_start_vox = np.round((output_origin - cls_off) / cls_res).astype(int)
             cls_start_vox = np.maximum(cls_start_vox, 0)
 
             # Clip to label array bounds
@@ -573,7 +494,7 @@ class CellMapDataset3D(Dataset):
                 continue
 
             try:
-                label_patch = self._ts_read(
+                label_patch = self._zarr_read(
                     os.path.join(ci.zarr_path, ci.scale_path),
                     (
                         slice(int(cls_start_vox[0]), int(cls_end_vox[0])),
@@ -592,18 +513,18 @@ class CellMapDataset3D(Dataset):
             # Binarize: >0 and !=255 means present
             label_binary = ((label_patch > 0) & (label_patch != 255)).astype(np.float32)
 
-            # Place label into full patch-sized canvas, then resample
-            # For small crops, label only covers part of the patch
+            # Place label into full output-sized canvas, then resample
+            # For small crops, label only covers part of the output
             if label_binary.shape != tuple(cls_patch_vox):
-                label_origin_in_patch = np.round(
-                    (cls_off + cls_start_vox * cls_res - sample_origin) / cls_res
+                label_origin_in_output = np.round(
+                    (cls_off + cls_start_vox * cls_res - output_origin) / cls_res
                 ).astype(int)
-                label_origin_in_patch = np.maximum(label_origin_in_patch, 0)
+                label_origin_in_output = np.maximum(label_origin_in_output, 0)
 
                 canvas = np.zeros(tuple(cls_patch_vox), dtype=np.float32)
                 slices = tuple(
-                    slice(label_origin_in_patch[i],
-                          min(label_origin_in_patch[i] + label_binary.shape[i], cls_patch_vox[i]))
+                    slice(label_origin_in_output[i],
+                          min(label_origin_in_output[i] + label_binary.shape[i], cls_patch_vox[i]))
                     for i in range(3)
                 )
                 trimmed = tuple(
@@ -613,18 +534,36 @@ class CellMapDataset3D(Dataset):
                 canvas[slices] = label_binary[trimmed]
                 label_binary = canvas
 
-            # Resample to patch_size
-            if label_binary.shape != (D, H, W):
+            # Resample to output_size
+            if label_binary.shape != (oD, oH, oW):
                 zoom_factors = (
-                    D / label_binary.shape[0],
-                    H / label_binary.shape[1],
-                    W / label_binary.shape[2],
+                    oD / label_binary.shape[0],
+                    oH / label_binary.shape[1],
+                    oW / label_binary.shape[2],
                 )
                 label_binary = ndimage_zoom(label_binary, zoom_factors, order=0)
 
-            labels[cls_idx] = label_binary[:D, :H, :W]
+            labels[cls_idx] = label_binary[:oD, :oH, :oW]
 
-        return raw_patch, labels, annotated_mask, spatial_mask
+        # --- Build provenance metadata ---
+        output_origin = sample_origin + self.output_offset_world
+        metadata = {
+            "dataset": crop.dataset_name,
+            "crop": crop.crop_id,
+            "raw_zarr_path": os.path.join(crop.raw_zarr_path, crop.raw_scale_path),
+            "raw_voxel_slices": [
+                [int(raw_start_vox[i]), int(raw_end_vox[i])] for i in range(3)
+            ],
+            "sample_origin_world": sample_origin.tolist(),
+            "output_origin_world": output_origin.tolist(),
+            "raw_resolution": crop.raw_resolution,
+            "target_resolution": float(self.target_resolution),
+            "annotated_classes": sorted(crop.annotated_classes),
+            "crop_origin_world": crop.crop_origin_world,
+            "crop_extent_world": crop.crop_extent_world,
+        }
+
+        return raw_patch, labels, annotated_mask, spatial_mask, metadata
 
     # ------------------------------------------------------------------
     # Dataset interface
@@ -640,18 +579,19 @@ class CellMapDataset3D(Dataset):
         ClassBalancedSampler). Otherwise a random crop is chosen.
 
         Returns:
-            raw: torch.Tensor [1, D, H, W] float32
-            labels: torch.Tensor [n_classes, D, H, W] float32
+            raw: torch.Tensor [1, iD, iH, iW] float32 (input_size)
+            labels: torch.Tensor [n_classes, oD, oH, oW] float32 (output_size)
             annotated_mask: torch.Tensor [n_classes] bool
-            spatial_mask: torch.Tensor [1, D, H, W] float32
-            crop_name: str, e.g. "jrc_hela-2/crop1"
+            spatial_mask: torch.Tensor [1, oD, oH, oW] float32 (output_size)
+            metadata: dict with provenance info (dataset, crop, paths,
+                world coordinates, resolution, annotated classes)
         """
         if idx < len(self.crops):
             crop = self.crops[idx]
         else:
             crop = self.crops[self.rng.integers(len(self.crops))]
 
-        raw, labels, annotated_mask, spatial_mask = self._extract_patch(crop)
+        raw, labels, annotated_mask, spatial_mask, metadata = self._extract_patch(crop)
 
         raw = torch.from_numpy(raw[np.newaxis])  # [1, D, H, W]
         labels = torch.from_numpy(labels)
@@ -661,9 +601,7 @@ class CellMapDataset3D(Dataset):
         if self.transforms is not None:
             raw, labels = self.transforms(raw, labels)
 
-        crop_name = f"{crop.dataset_name}/{crop.crop_id}"
-
-        return raw, labels, annotated_mask, spatial_mask, crop_name
+        return raw, labels, annotated_mask, spatial_mask, metadata
 
     # ------------------------------------------------------------------
     # Utilities
@@ -689,7 +627,8 @@ class CellMapDataset3D(Dataset):
             f"  Crops: {len(self.crops)}",
             f"  Target classes: {self.n_classes}",
             f"  Resolution: {self.target_resolution}nm",
-            f"  Patch size: {tuple(self.patch_size)}",
+            f"  Input size: {tuple(self.input_size)}",
+            f"  Output size: {tuple(self.output_size)}",
             f"",
             f"  Class presence (crops):",
         ]

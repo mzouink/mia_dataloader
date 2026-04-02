@@ -23,4 +23,4 @@ from .sampler import ClassBalancedSampler
 try:
     from .transforms import EMTransforms, get_train_transforms, get_train_transforms_from_config, get_val_transforms
 except ImportError:
-    pass
+    print("Warning: Monai is not installed, so transforms are unavailable. Install monai to use EMTransforms.")
