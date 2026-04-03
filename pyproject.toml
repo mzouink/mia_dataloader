@@ -12,7 +12,8 @@ dependencies = [
     "torch>=2.0",
     "numpy",
     "scipy",
-    "tensorstore",
+    "zarr",
+    "matplotlib",
 ]
 
 [project.optional-dependencies]

@@ -12,7 +12,7 @@ from .models import (
 )
 from .base import MiaDataset3D, validate_em_dataset
 from .dataset import CellMapDataset3D
-from .concat import ConcatEMDataset
+from .concat import ConcatMiaDataset
 from .discover import discover_crops
 from .sampler import ClassBalancedSampler
 

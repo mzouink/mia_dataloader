@@ -1,12 +1,12 @@
 """Combine multiple EM datasets into a single dataset.
 
-``ConcatEMDataset`` wraps any number of datasets (``MiaDataset3D`` subclasses
+``ConcatMiaDataset`` wraps any number of datasets (``MiaDataset3D`` subclasses
 or duck-typed equivalents) and presents them as one. Supports weighted
 sampling across datasets.
 
 Usage::
 
-    ds = ConcatEMDataset(
+    ds = ConcatMiaDataset(
         [cellmap_ds, custom_ds],
         weights=[0.7, 0.3],
         samples_per_epoch=2000,
@@ -27,7 +27,7 @@ from .base import MiaDataset3D, validate_em_dataset
 logger = logging.getLogger(__name__)
 
 
-class ConcatEMDataset(MiaDataset3D):
+class ConcatMiaDataset(MiaDataset3D):
     """Concatenate multiple EM datasets with optional weighted sampling.
 
     At init time, validates that all sub-datasets share the same
@@ -51,7 +51,7 @@ class ConcatEMDataset(MiaDataset3D):
         seed: int = 42,
     ):
         if len(datasets) == 0:
-            raise ValueError("ConcatEMDataset requires at least one dataset")
+            raise ValueError("ConcatMiaDataset requires at least one dataset")
 
         # Use the first dataset as the reference for contract checking
         ref = datasets[0]
@@ -106,7 +106,7 @@ class ConcatEMDataset(MiaDataset3D):
         self.samples_per_epoch = samples_per_epoch or sum(len(ds) for ds in datasets)
 
         logger.info(
-            f"ConcatEMDataset: {len(datasets)} datasets, "
+            f"ConcatMiaDataset: {len(datasets)} datasets, "
             f"{len(self.crops)} total crops, "
             f"weights={[f'{w:.2f}' for w in self._weights]}"
         )
@@ -141,7 +141,7 @@ class ConcatEMDataset(MiaDataset3D):
         class_matrix = self.get_crop_class_matrix()
         class_counts = class_matrix.sum(axis=0)
         lines = [
-            "ConcatEMDataset Summary",
+            "ConcatMiaDataset Summary",
             f"  Sub-datasets: {len(self.datasets)}",
             f"  Total crops: {len(self.crops)}",
             f"  Target classes: {self.n_classes}",

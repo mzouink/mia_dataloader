@@ -7,7 +7,7 @@ Solution: At each step, pick the least-seen class so far, then sample
 a crop that contains it. This ensures all classes get roughly equal
 representation over the course of an epoch.
 
-Works with ``CellMapDataset3D``, ``ConcatEMDataset``, or any dataset
+Works with ``CellMapDataset3D``, ``ConcatMiaDataset``, or any dataset
 that implements ``get_crop_class_matrix()``.
 """
 

@@ -1,9 +1,9 @@
 #%%
-"""Demo: combining multiple datasets with ConcatEMDataset.
+"""Demo: combining multiple datasets with ConcatMiaDataset.
 
 Shows how to:
 1. Load a CropDatabase and create two CellMapDataset3D with different splits
-2. Combine them with ConcatEMDataset (weighted sampling)
+2. Combine them with ConcatMiaDataset (weighted sampling)
 3. Use ClassBalancedSampler on the combined dataset
 4. Also validates a plain third-party dataset via validate_em_dataset
 """
@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from mia_em_loader import (
     CellMapDataset3D,
-    ConcatEMDataset,
+    ConcatMiaDataset,
     ClassBalancedSampler,
     CropDatabase,
     discover_crops,
@@ -57,11 +57,11 @@ print(f"Dataset A: {len(ds_a.crops)} crops")
 print(f"Dataset B: {len(ds_b.crops)} crops")
 
 # ---------------------------------------------------------------------------
-# Step 3: Combine with ConcatEMDataset
+# Step 3: Combine with ConcatMiaDataset
 # ---------------------------------------------------------------------------
 
 #%%
-combined = ConcatEMDataset(
+combined = ConcatMiaDataset(
     [ds_a, ds_b],
     weights=[0.6, 0.4],       # sample 60% from A, 40% from B
     samples_per_epoch=1000,
@@ -122,7 +122,7 @@ validate_em_dataset(dummy_ds, target_classes=CLASSES, input_size=(64, 64, 64))
 print("\nDummyEMDataset passed validation!")
 
 # Now combine it with the real CellMap data
-mixed = ConcatEMDataset(
+mixed = ConcatMiaDataset(
     [ds_a, dummy_ds],
     weights=[0.8, 0.2],
     samples_per_epoch=500,
