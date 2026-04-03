@@ -1,10 +1,8 @@
 # mia_em_loader
 
-Generic 3D multi-label EM data loading for CellMap-style Zarr datasets.
+Generic 3D multi-label data loading for CellMap-style Zarr datasets.
 
 ![Sample output](imgs/img.png)
-
-`mia_em_loader` provides PyTorch-compatible datasets and samplers for training neural networks on volumetric electron microscopy segmentation tasks with multiple organelle classes.
 
 ## Features
 
@@ -15,20 +13,6 @@ Generic 3D multi-label EM data loading for CellMap-style Zarr datasets.
 - **Multi-dataset composition**: combine datasets from different sources with weighted sampling
 - **Two-phase workflow**: discover crops once, reuse the metadata forever
 
-## Installation
-
-```bash
-# Core
-pip install .
-
-# With MONAI augmentations
-pip install ".[transforms]"
-
-# Development
-pip install -e ".[dev,transforms]"
-```
-
-**Requirements:** Python >= 3.10, PyTorch >= 2.0
 
 ## Quick Start
 
@@ -44,17 +28,6 @@ db = discover_crops(
     target_resolution=8.0,
 )
 db.to_json("crops.json")
-```
-
-Or from the command line:
-
-```bash
-python -m mia_em_loader.discover \
-    --data-root /nrs/cellmap/data \
-    --norms-csv norms.csv \
-    --target-classes ecs cell nuc mito er golgi \
-    --output crops.json \
-    --target-resolution 8.0
 ```
 
 ### 2. Create a dataset and train
@@ -108,23 +81,6 @@ combined = ConcatMiaDataset(
 )
 ```
 
-## Architecture
-
-```
-mia_em_loader/
-├── discover.py      # One-time crop discovery from Zarr hierarchy
-├── models.py        # CropDatabase, CropInfo, NormParams, ClassInfo
-├── base.py          # MiaDataset3D abstract base class
-├── dataset.py       # CellMapDataset3D (main dataset)
-├── concat.py        # ConcatMiaDataset (multi-dataset composition)
-├── sampler.py       # ClassBalancedSampler
-├── transforms.py    # EMTransforms (MONAI-based augmentations)
-└── utils/
-    └── ds_multiscale_utils.py  # Zarr I/O and OME-NGFF helpers
-```
-
-See [docs/architecture.md](docs/architecture.md) for detailed data flow diagrams and the full PyTorch integration map.
-
 ## Custom Transforms
 
 Any callable with signature `(raw: Tensor, labels: Tensor) -> (raw, labels)` works:
@@ -146,14 +102,3 @@ ds = CellMapDataset3D(..., transforms=MyTransforms())
 
 See [docs/architecture.md](docs/architecture.md#how-to-add-custom-transforms) for more options and the full transform contract.
 
-## Examples
-
-| Script | Description |
-|--------|-------------|
-| [examples/cellmap_demo.py](examples/cellmap_demo.py) | Single-dataset loading with visualization |
-| [examples/concat_demo.py](examples/concat_demo.py) | Multi-dataset composition and custom dataset validation |
-| [examples/benchmark_workers.py](examples/benchmark_workers.py) | DataLoader performance profiling |
-
-## License
-
-BSD-3-Clause
