@@ -13,15 +13,15 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 from scipy.ndimage import zoom as ndimage_zoom
-from torch.utils.data import Dataset
 
+from .base import MiaDataset3D
 from .models import CropDatabase, CropInfo, NormParams
 from .utils import zarr_read
 
 logger = logging.getLogger(__name__)
 
 
-class CellMapDataset3D(Dataset):
+class CellMapDataset3D(MiaDataset3D):
     """Generic 3D multi-label dataset for CellMap-style zarr EM data.
 
     Receives a ``CropDatabase`` and samples random 3D patches returning

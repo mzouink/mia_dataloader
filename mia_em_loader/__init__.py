@@ -10,7 +10,9 @@ from .models import (
     CropInfo,
     CropDatabase,
 )
+from .base import MiaDataset3D, validate_em_dataset
 from .dataset import CellMapDataset3D
+from .concat import ConcatEMDataset
 from .discover import discover_crops
 from .sampler import ClassBalancedSampler
 

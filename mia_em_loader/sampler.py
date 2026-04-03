@@ -1,11 +1,14 @@
-"""Class-balanced sampling for CellMapDataset3D.
+"""Class-balanced sampling for any MiaDataset3D-compatible dataset.
 
 Problem: Some classes appear in 200+ crops, others in <10.
 Uniform crop sampling means rare classes barely appear in training.
 
 Solution: At each step, pick the least-seen class so far, then sample
-a crop that contains it. This ensures all 48 classes get roughly equal
+a crop that contains it. This ensures all classes get roughly equal
 representation over the course of an epoch.
+
+Works with ``CellMapDataset3D``, ``ConcatEMDataset``, or any dataset
+that implements ``get_crop_class_matrix()``.
 """
 
 from __future__ import annotations
@@ -30,7 +33,7 @@ class ClassBalancedSampler(Sampler):
     as often as common classes (e.g., mito with 200+ crops).
 
     Args:
-        dataset: A CellMapDataset3D instance (must have .crops and .get_crop_class_matrix()).
+        dataset: Any MiaDataset3D-compatible dataset (must have .crops and .get_crop_class_matrix()).
         samples_per_epoch: Number of samples per epoch.
         seed: Random seed for reproducibility.
     """
